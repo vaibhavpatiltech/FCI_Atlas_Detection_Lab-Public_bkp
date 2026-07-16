@@ -1101,6 +1101,339 @@ def generate_ai_network_recommendation(
         return fallback_text, status
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# "Ask Atlas" RAG pipeline
+#
+# Retrieval corpus is built strictly from this run's own analysis outputs
+# (network summary, theme/subtheme triggers, node risk rankings, transaction
+# corridors, and flagged/high-value transactions) for the currently selected
+# target/network. Nothing outside this run's data is retrieved or invented.
+#
+# Embeddings: OpenAI (text-embedding-3-small) when OPENAI_API_KEY is
+# configured; otherwise a dependency-free local TF-IDF vectorizer so the
+# feature still works with Gemini/Groq/Ollama/Deterministic selected as the
+# answering provider. The index is rebuilt in-memory (numpy) whenever the
+# target, network focus, hop radius, or lookback window changes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+RAG_EMBED_MODEL = "text-embedding-3-small"
+RAG_TOP_K = 6
+RAG_MAX_TXN_CHUNKS = 60  # caps per-transaction chunks so the in-memory index stays cheap to build/search
+
+
+def _rag_tokenize(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", str(text).lower())
+
+
+def _rag_build_local_tfidf(corpus: List[str]):
+    """Pure numpy/stdlib TF-IDF index used as a fallback when no embeddings API key is configured."""
+    doc_tokens = [_rag_tokenize(t) for t in corpus]
+    vocab: dict = {}
+    for tokens in doc_tokens:
+        for tok in set(tokens):
+            if tok not in vocab:
+                vocab[tok] = len(vocab)
+
+    n_docs = max(1, len(corpus))
+    df_counts = np.zeros(max(1, len(vocab)), dtype=np.float64)
+    for tokens in doc_tokens:
+        for tok in set(tokens):
+            df_counts[vocab[tok]] += 1
+    idf = np.log((1.0 + n_docs) / (1.0 + df_counts)) + 1.0
+
+    matrix = np.zeros((len(corpus), max(1, len(vocab))), dtype=np.float64)
+    for i, tokens in enumerate(doc_tokens):
+        if not tokens:
+            continue
+        counts: dict = {}
+        for tok in tokens:
+            counts[tok] = counts.get(tok, 0) + 1
+        max_count = max(counts.values())
+        for tok, c in counts.items():
+            tf = 0.5 + 0.5 * (c / max_count)
+            matrix[i, vocab[tok]] = tf * idf[vocab[tok]]
+
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    matrix = matrix / norms
+    return matrix, vocab, idf
+
+
+def _rag_vectorize_query_local(query: str, vocab: dict, idf) -> np.ndarray:
+    tokens = _rag_tokenize(query)
+    vec = np.zeros(max(1, len(vocab)), dtype=np.float64)
+    if not tokens or idf is None:
+        return vec
+    counts: dict = {}
+    for tok in tokens:
+        counts[tok] = counts.get(tok, 0) + 1
+    max_count = max(counts.values())
+    for tok, c in counts.items():
+        idx = vocab.get(tok)
+        if idx is None:
+            continue
+        tf = 0.5 + 0.5 * (c / max_count)
+        vec[idx] = tf * idf[idx]
+    norm = np.linalg.norm(vec)
+    if norm > 0:
+        vec = vec / norm
+    return vec
+
+
+def _rag_embed_openai(texts: List[str], model: str = RAG_EMBED_MODEL) -> np.ndarray:
+    if not openai.api_key:
+        raise RuntimeError("OpenAI API key is not configured.")
+    vectors: List[List[float]] = []
+    batch_size = 96
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start:start + batch_size]
+        response = openai.embeddings.create(model=model, input=batch)
+        vectors.extend([item.embedding for item in response.data])
+    arr = np.array(vectors, dtype=np.float64)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return arr / norms
+
+
+def build_rag_chunks(analyzer, outputs: dict, scope_network_id: str) -> List[dict]:
+    """Builds retrievable text chunks strictly from this run's analysis outputs (network summary,
+    theme/subtheme triggers, node risk rankings, transaction corridors, and flagged/high-value
+    transactions) for the selected network, or across all sub-networks if the Full Network is focused."""
+    chunks: List[dict] = []
+
+    is_full = str(scope_network_id) == str(analyzer.full_network_id)
+    network_ids = analyzer.get_network_ids()
+    scoped_ids = network_ids if is_full else [str(scope_network_id)]
+
+    network_summary = outputs.get("network_summary", pd.DataFrame())
+    if isinstance(network_summary, pd.DataFrame) and not network_summary.empty:
+        scoped_summary = network_summary[network_summary["network_id"].astype(str).isin(scoped_ids)]
+        for r in scoped_summary.itertuples(index=False):
+            chunks.append({
+                "source": f"network_summary:{r.network_id}",
+                "text": (
+                    f"Network {r.network_id} summary: {r.nodes} nodes, {r.edges} edges, {r.txn_count} transactions, "
+                    f"total value ${r.total_amount_usd:,.0f}, cross-border ratio {r.cross_border_ratio:.2f}, "
+                    f"flagged node counts ({r.flagged_nodes_counts}), overall network risk score {r.network_risk_score:.1f}."
+                ),
+            })
+
+    theme_log = outputs.get("theme_triggers", pd.DataFrame())
+    if isinstance(theme_log, pd.DataFrame) and not theme_log.empty:
+        scoped_themes = theme_log[theme_log["network_id"].astype(str).isin(scoped_ids)]
+        for r in scoped_themes.itertuples(index=False):
+            chunks.append({
+                "source": f"theme:{r.network_id}:{r.subtheme}",
+                "text": (
+                    f"Network {r.network_id} theme '{r.theme} -> {r.subtheme}' severity {r.severity_score:.1f}. "
+                    f"Evidence: {r.evidence_summary}. Example transactions: {r.example_transaction_ids or 'none'}."
+                ),
+            })
+
+    node_rankings = outputs.get("node_rankings", pd.DataFrame())
+    if isinstance(node_rankings, pd.DataFrame) and not node_rankings.empty:
+        scoped_nodes = node_rankings[node_rankings["network_id"].astype(str).isin(scoped_ids)]
+        for r in scoped_nodes.itertuples(index=False):
+            flags = []
+            if r.sanctions_flag:
+                flags.append("Sanctions")
+            if r.pep_flag:
+                flags.append("PEP")
+            if r.sar_flag:
+                flags.append("SAR")
+            if r.exited_flag:
+                flags.append("Exited")
+            try:
+                kyc = analyzer.get_customer_kyc(r.customer_id)
+            except Exception:
+                kyc = {}
+            chunks.append({
+                "source": f"node:{r.network_id}:{r.customer_id}",
+                "text": (
+                    f"Customer {r.customer_id} ({r.customer_name}) in network {r.network_id}: "
+                    f"country {r.country}, entity type {r.entity_type}, node risk score {r.final_node_risk_score:.1f}, "
+                    f"flags: {', '.join(flags) if flags else 'none'}. Reasons: {r.key_reasons}. "
+                    f"Gender: {kyc.get('gender', '')}. DOB/incorp date: {kyc.get('date_of_birth_or_incorp', '')}. "
+                    f"Exit date: {kyc.get('exit_date', '') or 'n/a'}."
+                ),
+            })
+
+    for nid in scoped_ids:
+        edge_df = analyzer.network_edge_agg.get(nid, pd.DataFrame())
+        if edge_df is None or edge_df.empty:
+            continue
+        for r in edge_df.itertuples(index=False):
+            chunks.append({
+                "source": f"corridor:{nid}:{r.source}->{r.target}",
+                "text": (
+                    f"Network {nid} corridor {r.source} -> {r.target}: {int(r.txn_count)} transactions, "
+                    f"total ${r.total_amount_usd:,.0f}, avg ${r.avg_amount_usd:,.0f}, max ${r.max_amount_usd:,.0f}, "
+                    f"first transaction {r.first_txn_dt}, last transaction {r.last_txn_dt}, "
+                    f"top channel {r.top_channel}, top product {r.top_product}, "
+                    f"scenario tags: {r.scenario_tag_counts or 'none'}."
+                ),
+            })
+
+    txn_frames = []
+    for nid in scoped_ids:
+        t = analyzer.network_txn.get(nid, pd.DataFrame())
+        if t is not None and not t.empty:
+            txn_frames.append(t)
+    if txn_frames:
+        all_txn = pd.concat(txn_frames, ignore_index=True)
+        flagged_mask = (
+            all_txn["originator_sar_flag"] | all_txn["beneficiary_sar_flag"]
+            | all_txn["originator_sanctions_flag"] | all_txn["beneficiary_sanctions_flag"]
+            | all_txn["originator_pep_flag"] | all_txn["beneficiary_pep_flag"]
+        )
+        priority = all_txn[flagged_mask]
+        remaining_slots = RAG_MAX_TXN_CHUNKS - len(priority)
+        if remaining_slots > 0:
+            others = all_txn.drop(priority.index).sort_values("amount_usd", ascending=False).head(remaining_slots)
+            sampled = pd.concat([priority, others])
+        else:
+            sampled = priority.head(RAG_MAX_TXN_CHUNKS)
+        for r in sampled.itertuples(index=False):
+            chunks.append({
+                "source": f"txn:{r.transaction_id}",
+                "text": (
+                    f"Transaction {r.transaction_id} (ref {r.reference_number}) on {r.transaction_datetime}: "
+                    f"{r.originator_name} ({r.originator_id}) -> {r.beneficiary_name} ({r.beneficiary_id}), "
+                    f"amount ${r.amount_usd:,.2f}, type {r.transaction_type}, channel {r.channel}, "
+                    f"product {r.product}, scenario tag {r.scenario_tag or 'none'}."
+                ),
+            })
+
+    return chunks
+
+
+def build_or_get_rag_index(analyzer, outputs: dict, scope_network_id: str, target_customer_id: str, force_rebuild: bool = False) -> dict:
+    """Builds (or reuses from session state) an in-memory retrieval index scoped to the current
+    target/network/hop/lookback configuration. Rebuilds automatically whenever that scope changes."""
+    scope_key = (
+        str(target_customer_id),
+        str(scope_network_id),
+        int(getattr(analyzer.config, "n_hops", 2)),
+        int(getattr(analyzer.config, "lookback_days", 180)),
+        bool(getattr(analyzer.config, "use_all_dates", False)),
+    )
+    cached = st.session_state.get("rag_index")
+    if not force_rebuild and cached and cached.get("scope_key") == scope_key:
+        return cached
+
+    chunks = build_rag_chunks(analyzer, outputs, scope_network_id)
+    if not chunks:
+        index = {"scope_key": scope_key, "chunks": [], "backend": "none", "vectors": None, "vocab": {}, "idf": None}
+        st.session_state["rag_index"] = index
+        return index
+
+    texts = [c["text"] for c in chunks]
+    backend = "openai" if OPENAI_API_KEY else "local"
+    vocab: dict = {}
+    idf = None
+    try:
+        if backend != "openai":
+            raise RuntimeError("no OpenAI key configured")
+        vectors = _rag_embed_openai(texts)
+    except Exception:
+        backend = "local"
+        vectors, vocab, idf = _rag_build_local_tfidf(texts)
+
+    index = {"scope_key": scope_key, "chunks": chunks, "backend": backend, "vectors": vectors, "vocab": vocab, "idf": idf}
+    st.session_state["rag_index"] = index
+    return index
+
+
+def rag_retrieve(index: dict, query: str, top_k: int = RAG_TOP_K) -> List[dict]:
+    chunks = index.get("chunks") or []
+    vectors = index.get("vectors")
+    if not chunks or vectors is None or len(vectors) == 0 or not str(query).strip():
+        return []
+    backend = index.get("backend")
+    if backend == "openai":
+        try:
+            q_vec = _rag_embed_openai([query])[0]
+        except Exception:
+            return []
+    else:
+        q_vec = _rag_vectorize_query_local(query, index.get("vocab", {}), index.get("idf"))
+
+    scores = vectors @ q_vec
+    top_idx = np.argsort(-scores)[:top_k]
+    results = []
+    for i in top_idx:
+        if scores[i] <= 1e-6:
+            continue
+        results.append({**chunks[int(i)], "score": float(scores[i])})
+    return results
+
+
+def build_ask_atlas_prompt(query: str, context_chunks: List[dict]) -> str:
+    context_text = "\n".join([f"[{i + 1}] {c['text']}" for i, c in enumerate(context_chunks)])
+    return (
+        "You are Atlas, an AML investigator assistant. Answer the question ONLY using the numbered context "
+        "items below, which are drawn directly from this case's own network analysis output (nothing external). "
+        "If the answer is not present in the context, say so plainly rather than guessing or inventing facts. "
+        "Cite the relevant item numbers in brackets, e.g. [2], [4]. Keep the answer concise and factual.\n\n"
+        f"Context:\n{context_text}\n\n"
+        f"Question: {query}\n"
+        "Answer:"
+    )
+
+
+def _rag_deterministic_answer(context_chunks: List[dict]) -> str:
+    if not context_chunks:
+        return "No matching information was found in the current analysis output for this question."
+    lines = ["Deterministic mode — most relevant analysis facts retrieved for this question:"]
+    for i, c in enumerate(context_chunks, start=1):
+        lines.append(f"[{i}] {c['text']}")
+    return "\n".join(lines)
+
+
+def generate_ask_atlas_answer(query: str, context_chunks: List[dict], ai_provider: str, ai_model: str, ollama_model: str) -> tuple:
+    """Answers a user question using the AI provider selected in the sidebar, grounded strictly in the
+    retrieved context chunks. Falls back to a deterministic extractive answer if the provider is
+    unavailable or unconfigured. Returns (answer_text, status_message)."""
+    if not context_chunks:
+        return (
+            "I couldn't find anything relevant to that in the current network analysis output. Try "
+            "rephrasing the question, or widen the hop radius / lookback window in the sidebar and rerun "
+            "the analysis.",
+            "No retrieved context matched this query.",
+        )
+
+    prompt = build_ask_atlas_prompt(query, context_chunks)
+    try:
+        if ai_provider == "OpenAI":
+            if not OPENAI_API_KEY:
+                raise RuntimeError("OPENAI_API_KEY is not configured")
+            text = _openai_chat(prompt, model=ai_model or "gpt-5.5", max_tokens=800)
+            status = f"Answered using OpenAI model '{ai_model}'; retrieved {len(context_chunks)} context items."
+        elif ai_provider == "Gemini":
+            if not GEMINI_API_KEY:
+                raise RuntimeError("GEMINI_API_KEY is not configured")
+            text = _gemini_chat(prompt, model=ai_model or "gemini-2.5-flash", max_tokens=800)
+            status = f"Answered using Gemini model '{ai_model}'; retrieved {len(context_chunks)} context items."
+        elif ai_provider == "Groq":
+            if not GROQ_API_KEY:
+                raise RuntimeError("GROQ_API_KEY is not configured")
+            text = _groq_chat(prompt, model=ai_model or "qwen/qwen3-32b", max_tokens=800)
+            status = f"Answered using Groq model '{ai_model}'; retrieved {len(context_chunks)} context items."
+        elif ai_provider == "Ollama (Local)":
+            if not HAS_OLLAMA:
+                raise RuntimeError("ollama package is not installed")
+            text = _ollama_chat(prompt, model=ollama_model.strip() or "llama3.1:8b")
+            status = f"Answered using Ollama model '{(ollama_model.strip() or 'llama3.1:8b')}'; retrieved {len(context_chunks)} context items."
+        else:
+            text = _rag_deterministic_answer(context_chunks)
+            status = f"Deterministic mode; retrieved {len(context_chunks)} context items."
+        return _trim_incomplete_tail(text), status
+    except Exception as ex:
+        text = _rag_deterministic_answer(context_chunks)
+        status = f"{ai_provider} unavailable ({ex}); showing deterministic extractive answer from retrieved context."
+        return text, status
+
+
 def _generate_openai_investigator_summary(target_context: dict, baseline_text: str, model: str = "gpt-5.5") -> str:
     prompt = (
         "Rewrite the following investigator summary in a clear, concise, factual way for an AML investigator. "
@@ -3950,13 +4283,73 @@ if "analyzer" in st.session_state:
 
     with st.container(border=True):
         card_title("💬", "Ask Atlas")
-        st.text_area(
-            "Ask Atlas",
-            value="Ask anything to Atlas regarding the networks found",
-            disabled=True,
-            label_visibility="collapsed",
-            height=90,
+        st.caption(
+            "Ask questions grounded in this run's network summary, theme/subtheme triggers, node risk "
+            "rankings, transaction corridors, and flagged/high-value transactions for the selected "
+            f"target/network. Answers use the AI provider selected in the sidebar ({ai_provider})."
         )
+
+        rag_scope_network = str(selected_network) if selected_network else str(analyzer.full_network_id)
+        rag_index = build_or_get_rag_index(
+            analyzer=analyzer,
+            outputs=outputs,
+            scope_network_id=rag_scope_network,
+            target_customer_id=str(target_customer_id),
+        )
+
+        backend_label = {
+            "openai": "OpenAI embeddings",
+            "local": "local TF-IDF (no OPENAI_API_KEY configured)",
+            "none": "empty — run analysis to populate",
+        }.get(rag_index.get("backend"), "unknown")
+
+        col_idx1, col_idx2 = st.columns([3, 1])
+        with col_idx1:
+            st.caption(
+                f"Knowledge index: {len(rag_index.get('chunks', []))} items scoped to "
+                f"{rag_scope_network} · backend: {backend_label}"
+            )
+        with col_idx2:
+            if st.button("🔄 Rebuild index", key="rag_rebuild_btn"):
+                build_or_get_rag_index(
+                    analyzer=analyzer,
+                    outputs=outputs,
+                    scope_network_id=rag_scope_network,
+                    target_customer_id=str(target_customer_id),
+                    force_rebuild=True,
+                )
+                st.rerun()
+
+        history_key = "ask_atlas_history"
+        scope_state_key = "ask_atlas_scope"
+        if st.session_state.get(scope_state_key) != rag_index.get("scope_key"):
+            st.session_state[history_key] = []
+            st.session_state[scope_state_key] = rag_index.get("scope_key")
+
+        for turn in st.session_state.get(history_key, []):
+            with st.chat_message(turn["role"]):
+                st.markdown(turn["content"])
+                if turn["role"] == "assistant":
+                    if turn.get("status"):
+                        st.caption(turn["status"])
+                    if turn.get("sources"):
+                        with st.expander("Retrieved context"):
+                            for i, c in enumerate(turn["sources"], start=1):
+                                st.caption(f"[{i}] {c['source']} · similarity {c['score']:.3f}")
+                                st.text(c["text"])
+
+        user_query = st.chat_input("Ask anything about the networks found (e.g. 'Why is customer X flagged?')")
+        if user_query:
+            st.session_state[history_key].append({"role": "user", "content": user_query})
+            with st.spinner("Retrieving context and generating answer..."):
+                retrieved = rag_retrieve(rag_index, user_query, top_k=RAG_TOP_K)
+                answer_text, answer_status = generate_ask_atlas_answer(
+                    user_query, retrieved, ai_provider, ai_model, ollama_model
+                )
+            st.session_state[history_key].append(
+                {"role": "assistant", "content": answer_text, "sources": retrieved, "status": answer_status}
+            )
+            st.rerun()
 
 else:
     st.info("Select target customer and click Run analysis.")
