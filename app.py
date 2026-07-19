@@ -1247,8 +1247,16 @@ def build_rag_chunks(analyzer, outputs: dict, scope_network_id: str) -> List[dic
             })
 
     node_rankings = outputs.get("node_rankings", pd.DataFrame())
+    profiles = getattr(analyzer, "node_profiles", pd.DataFrame())
+    dra_map: dict = {}
+    if isinstance(profiles, pd.DataFrame) and not profiles.empty and "dra_score" in profiles.columns:
+        dra_map = dict(zip(profiles["customer_id"].astype(str), pd.to_numeric(profiles["dra_score"], errors="coerce").fillna(0.0)))
+
+    scoped_nodes = pd.DataFrame()
     if isinstance(node_rankings, pd.DataFrame) and not node_rankings.empty:
-        scoped_nodes = node_rankings[node_rankings["network_id"].astype(str).isin(scoped_ids)]
+        scoped_nodes = node_rankings[node_rankings["network_id"].astype(str).isin(scoped_ids)].copy()
+        scoped_nodes["dra_score"] = scoped_nodes["customer_id"].astype(str).map(lambda cid: float(dra_map.get(cid, 0.0)))
+
         for r in scoped_nodes.itertuples(index=False):
             flags = []
             if r.sanctions_flag:
@@ -1268,11 +1276,72 @@ def build_rag_chunks(analyzer, outputs: dict, scope_network_id: str) -> List[dic
                 "text": (
                     f"Customer {r.customer_id} ({r.customer_name}) in network {r.network_id}: "
                     f"country {r.country}, entity type {r.entity_type}, node risk score {r.final_node_risk_score:.1f}, "
-                    f"flags: {', '.join(flags) if flags else 'none'}. Reasons: {r.key_reasons}. "
-                    f"Gender: {kyc.get('gender', '')}. DOB/incorp date: {kyc.get('date_of_birth_or_incorp', '')}. "
+                    f"DRA score {r.dra_score:.1f}, flags: {', '.join(flags) if flags else 'none'}. "
+                    f"Reasons: {r.key_reasons}. Gender: {kyc.get('gender', '')}. "
+                    f"DOB/incorp date: {kyc.get('date_of_birth_or_incorp', '')}. "
                     f"Exit date: {kyc.get('exit_date', '') or 'n/a'}."
                 ),
             })
+
+        # Pre-computed leaderboards so superlative questions ("highest DRA", "top risk score") can be
+        # answered directly, since similarity search alone won't reliably surface a max across many
+        # individual customer chunks.
+        dra_leader = scoped_nodes.sort_values("dra_score", ascending=False).head(10)
+        if not dra_leader.empty:
+            lines = [
+                f"{i + 1}) {r.customer_id} ({r.customer_name}), network {r.network_id}: DRA score {r.dra_score:.1f}"
+                for i, r in enumerate(dra_leader.itertuples(index=False))
+            ]
+            chunks.append({
+                "source": f"leaderboard:dra_score:{'-'.join(scoped_ids)}",
+                "text": (
+                    "DRA score leaderboard for customers in scope, ranked highest to lowest "
+                    "(use this to answer 'which customer has the highest/lowest DRA score'): " + "; ".join(lines)
+                ),
+            })
+
+        risk_leader = scoped_nodes.sort_values("final_node_risk_score", ascending=False).head(10)
+        if not risk_leader.empty:
+            lines2 = [
+                f"{i + 1}) {r.customer_id} ({r.customer_name}), network {r.network_id}: node risk score {r.final_node_risk_score:.1f}"
+                for i, r in enumerate(risk_leader.itertuples(index=False))
+            ]
+            chunks.append({
+                "source": f"leaderboard:node_risk_score:{'-'.join(scoped_ids)}",
+                "text": (
+                    "Node risk score leaderboard for customers in scope, ranked highest to lowest "
+                    "(use this to answer 'which customer has the highest/riskiest score'): " + "; ".join(lines2)
+                ),
+            })
+
+    # Connectivity leaderboard: distinct counterparties per customer, used to answer 'densest network' /
+    # 'most connected customer' questions.
+    name_map: dict = {}
+    if isinstance(scoped_nodes, pd.DataFrame) and not scoped_nodes.empty:
+        name_map = dict(zip(scoped_nodes["customer_id"].astype(str), scoped_nodes["customer_name"].astype(str)))
+    neighbor_sets: dict = {}
+    for nid in scoped_ids:
+        e = analyzer.network_edge_agg.get(nid, pd.DataFrame())
+        if e is None or e.empty:
+            continue
+        for r in e[["source", "target"]].itertuples(index=False):
+            src, tgt = str(r.source), str(r.target)
+            neighbor_sets.setdefault(src, set()).add(tgt)
+            neighbor_sets.setdefault(tgt, set()).add(src)
+    if neighbor_sets:
+        top_connected = sorted(neighbor_sets.items(), key=lambda kv: -len(kv[1]))[:10]
+        lines3 = [
+            f"{i + 1}) {cid} ({name_map.get(cid, '')}): {len(neighbors)} distinct counterparties"
+            for i, (cid, neighbors) in enumerate(top_connected)
+        ]
+        chunks.append({
+            "source": f"leaderboard:connectivity:{'-'.join(scoped_ids)}",
+            "text": (
+                "Network connectivity leaderboard for customers in scope, ranked by number of distinct "
+                "counterparties (use this to answer 'which customer has the densest/most connected network'): "
+                + "; ".join(lines3)
+            ),
+        })
 
     for nid in scoped_ids:
         edge_df = analyzer.network_edge_agg.get(nid, pd.DataFrame())
