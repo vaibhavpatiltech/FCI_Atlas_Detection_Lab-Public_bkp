@@ -1469,6 +1469,184 @@ def get_uploaded_document_chunks() -> List[dict]:
     return chunks
 
 
+RAG_MAX_GLOBAL_CUSTOMERS = 800
+RAG_GLOBAL_LEADERBOARD_SIZE = 15
+
+
+def _rag_coerce_bool_series(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_bool_dtype(series):
+        return series.fillna(False)
+    return series.astype(str).str.strip().str.lower().isin(["1", "true", "y", "yes", "t"])
+
+
+def build_global_dataset_chunks(analyzer) -> List[dict]:
+    """Builds retrievable chunks from the FULL underlying synthetic dataset — every customer, not just
+    those inside the currently discovered n-hop network for the target. Aggregated to per-customer
+    profiles (plus DRA score / transaction value / flagged-status leaderboards) rather than one chunk
+    per raw transaction, to keep the index size and embedding cost manageable on a large dataset."""
+    raw_df = getattr(analyzer, "raw_df", pd.DataFrame())
+    if not isinstance(raw_df, pd.DataFrame) or raw_df.empty:
+        return []
+
+    df = raw_df.copy()
+    df.columns = [c.strip() for c in df.columns]
+    if not {"originator_id", "beneficiary_id"}.issubset(set(df.columns)):
+        return []
+
+    df["originator_id"] = df["originator_id"].astype(str).str.strip()
+    df["beneficiary_id"] = df["beneficiary_id"].astype(str).str.strip()
+    df = df[(df["originator_id"] != "") & (df["beneficiary_id"] != "")]
+    if df.empty:
+        return []
+
+    amount_usd = pd.to_numeric(df.get("amount_usd"), errors="coerce")
+    amount_usd = amount_usd.fillna(pd.to_numeric(df.get("amount"), errors="coerce")).fillna(0.0)
+    df["amount_usd"] = amount_usd
+
+    bool_cols = [
+        "originator_pep_flag", "originator_sanctions_flag", "originator_exited_flag", "originator_sar_flag",
+        "beneficiary_pep_flag", "beneficiary_sanctions_flag", "beneficiary_exited_flag", "beneficiary_sar_flag",
+    ]
+    for c in bool_cols:
+        df[c] = _rag_coerce_bool_series(df[c]) if c in df.columns else False
+
+    for c in ["originator_dra_score", "beneficiary_dra_score"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0) if c in df.columns else 0.0
+
+    def _side(role: str) -> pd.DataFrame:
+        return pd.DataFrame({
+            "customer_id": df[f"{role}_id"],
+            "customer_name": df.get(f"{role}_name", ""),
+            "country": df.get(f"{role}_country", ""),
+            "entity_type": df.get(f"{role}_entity_type", ""),
+            "pep_flag": df[f"{role}_pep_flag"],
+            "sanctions_flag": df[f"{role}_sanctions_flag"],
+            "sar_flag": df[f"{role}_sar_flag"],
+            "exited_flag": df[f"{role}_exited_flag"],
+            "dra_score": df[f"{role}_dra_score"],
+            "amount_usd": df["amount_usd"],
+        })
+
+    combined = pd.concat([_side("originator"), _side("beneficiary")], ignore_index=True)
+
+    def _mode_or_blank(s: pd.Series) -> str:
+        s = s.dropna().astype(str)
+        return s.value_counts().index[0] if not s.empty else ""
+
+    agg = combined.groupby("customer_id", as_index=False).agg(
+        customer_name=("customer_name", _mode_or_blank),
+        country=("country", _mode_or_blank),
+        entity_type=("entity_type", _mode_or_blank),
+        pep_flag=("pep_flag", "max"),
+        sanctions_flag=("sanctions_flag", "max"),
+        sar_flag=("sar_flag", "max"),
+        exited_flag=("exited_flag", "max"),
+        dra_score=("dra_score", "max"),
+        txn_count=("customer_id", "count"),
+        total_value_usd=("amount_usd", "sum"),
+    )
+
+    flagged_all = agg[agg["sanctions_flag"] | agg["pep_flag"] | agg["sar_flag"] | agg["exited_flag"]]
+
+    truncated = len(agg) > RAG_MAX_GLOBAL_CUSTOMERS
+    if truncated:
+        remaining = RAG_MAX_GLOBAL_CUSTOMERS - len(flagged_all)
+        if remaining > 0:
+            others = agg.drop(flagged_all.index).sort_values(
+                ["dra_score", "total_value_usd"], ascending=False
+            ).head(remaining)
+            agg_scoped = pd.concat([flagged_all, others])
+        else:
+            agg_scoped = flagged_all.head(RAG_MAX_GLOBAL_CUSTOMERS)
+    else:
+        agg_scoped = agg
+
+    chunks: List[dict] = []
+    for r in agg_scoped.itertuples(index=False):
+        flags = []
+        if r.sanctions_flag:
+            flags.append("Sanctions")
+        if r.pep_flag:
+            flags.append("PEP")
+        if r.sar_flag:
+            flags.append("SAR")
+        if r.exited_flag:
+            flags.append("Exited")
+        chunks.append({
+            "source": f"global_customer:{r.customer_id}",
+            "text": (
+                f"[Full dataset] Customer {r.customer_id} ({r.customer_name}): country {r.country}, "
+                f"entity type {r.entity_type}, DRA score {float(r.dra_score):.1f}, "
+                f"flags: {', '.join(flags) if flags else 'none'}, {int(r.txn_count)} transactions across "
+                f"the full dataset, total transaction value ${float(r.total_value_usd):,.0f}."
+            ),
+        })
+
+    dra_top = agg.sort_values("dra_score", ascending=False).head(RAG_GLOBAL_LEADERBOARD_SIZE)
+    if not dra_top.empty:
+        lines = [
+            f"{i + 1}) {r.customer_id} ({r.customer_name}): DRA score {float(r.dra_score):.1f}"
+            for i, r in enumerate(dra_top.itertuples(index=False))
+        ]
+        chunks.append({
+            "source": "global_leaderboard:dra_score",
+            "text": (
+                "Full-dataset DRA score leaderboard across ALL customers (not limited to the current "
+                "network), ranked highest to lowest: " + "; ".join(lines)
+            ),
+        })
+
+    value_top = agg.sort_values("total_value_usd", ascending=False).head(RAG_GLOBAL_LEADERBOARD_SIZE)
+    if not value_top.empty:
+        lines2 = [
+            f"{i + 1}) {r.customer_id} ({r.customer_name}): total value ${float(r.total_value_usd):,.0f} "
+            f"across {int(r.txn_count)} transactions"
+            for i, r in enumerate(value_top.itertuples(index=False))
+        ]
+        chunks.append({
+            "source": "global_leaderboard:total_value",
+            "text": (
+                "Full-dataset transaction value leaderboard across ALL customers (not limited to the "
+                "current network), ranked highest to lowest: " + "; ".join(lines2)
+            ),
+        })
+
+    if not flagged_all.empty:
+        lines3 = []
+        for r in flagged_all.head(100).itertuples(index=False):
+            flags = []
+            if r.sanctions_flag:
+                flags.append("Sanctions")
+            if r.pep_flag:
+                flags.append("PEP")
+            if r.sar_flag:
+                flags.append("SAR")
+            if r.exited_flag:
+                flags.append("Exited")
+            lines3.append(f"{r.customer_id} ({r.customer_name}): {', '.join(flags)}")
+        chunks.append({
+            "source": "global_leaderboard:flagged_customers",
+            "text": (
+                f"Full-dataset flagged customers (Sanctions/PEP/SAR/Exited), {len(flagged_all)} total "
+                f"across the whole dataset (showing up to 100): " + "; ".join(lines3)
+            ),
+        })
+
+    if truncated:
+        chunks.append({
+            "source": "global_leaderboard:coverage_note",
+            "text": (
+                f"Note: the full dataset contains {len(agg)} unique customers. To keep the knowledge index "
+                f"manageable, individual full-dataset customer profiles are capped at {RAG_MAX_GLOBAL_CUSTOMERS}, "
+                "prioritizing all flagged (Sanctions/PEP/SAR/Exited) customers plus the highest DRA score "
+                "and highest transaction value customers. Some low-risk, low-activity customers may not "
+                "have an individual profile chunk, but are still reflected in the leaderboards above."
+            ),
+        })
+
+    return chunks
+
+
 def build_or_get_rag_index(
     analyzer,
     outputs: dict,
@@ -1476,10 +1654,12 @@ def build_or_get_rag_index(
     target_customer_id: str,
     document_chunks: Optional[List[dict]] = None,
     force_rebuild: bool = False,
+    include_global: bool = False,
 ) -> dict:
     """Builds (or reuses from session state) an in-memory retrieval index scoped to the current
-    target/network/hop/lookback configuration, merged with any uploaded document chunks. Rebuilds
-    automatically whenever that scope or the uploaded document set changes."""
+    target/network/hop/lookback configuration, merged with any uploaded document chunks and, if
+    include_global is set, aggregated profiles/leaderboards from the full underlying dataset. Rebuilds
+    automatically whenever the scope, document set, or global-scan toggle changes."""
     document_chunks = document_chunks or []
     doc_signature = tuple(sorted(c["source"] for c in document_chunks))
     scope_key = (
@@ -1489,12 +1669,15 @@ def build_or_get_rag_index(
         int(getattr(analyzer.config, "lookback_days", 180)),
         bool(getattr(analyzer.config, "use_all_dates", False)),
         doc_signature,
+        bool(include_global),
     )
     cached = st.session_state.get("rag_index")
     if not force_rebuild and cached and cached.get("scope_key") == scope_key:
         return cached
 
     chunks = build_rag_chunks(analyzer, outputs, scope_network_id) + document_chunks
+    if include_global:
+        chunks = chunks + build_global_dataset_chunks(analyzer)
     if not chunks:
         index = {"scope_key": scope_key, "chunks": [], "backend": "none", "vectors": None, "vocab": {}, "idf": None}
         st.session_state["rag_index"] = index
@@ -1545,13 +1728,16 @@ def build_ask_atlas_prompt(query: str, context_chunks: List[dict]) -> str:
     context_text = "\n".join([f"[{i + 1}] {c['text']}" for i, c in enumerate(context_chunks)])
     return (
         "You are Atlas, an AML investigator assistant. Answer the question ONLY using the numbered context "
-        "items below. These are drawn from two possible sources: this case's own network analysis output "
-        "(network summary, themes, node risk, transaction corridors), and any documents the investigator has "
-        "uploaded for this case. Draw on whichever source is relevant, and combine both when useful — e.g. "
-        "connecting a fact from an uploaded document to a specific customer or transaction in the network data. "
+        "items below. These are drawn from up to three possible sources: this case's own network analysis "
+        "output (network summary, themes, node risk, transaction corridors) for the currently discovered "
+        "network; documents the investigator has uploaded for this case; and, when enabled, aggregated "
+        "profiles/leaderboards from the full underlying dataset, labeled '[Full dataset]', covering "
+        "customers beyond the currently discovered network. Draw on whichever source is relevant, and "
+        "combine sources when useful. If a fact comes from '[Full dataset]', make clear in your answer "
+        "that it may fall outside the currently audited network. "
         "If the answer is not present in the context, say so plainly rather than guessing or inventing facts. "
-        "Cite the relevant item numbers in brackets, e.g. [2], [4], and note whether each cited item came from "
-        "the network data or an uploaded document. Keep the answer concise and factual.\n\n"
+        "Cite the relevant item numbers in brackets, e.g. [2], [4], and note which source each cited item "
+        "came from. Keep the answer concise and factual.\n\n"
         f"Context:\n{context_text}\n\n"
         f"Question: {query}\n"
         "Answer:"
@@ -4515,6 +4701,19 @@ if "analyzer" in st.session_state:
 
         document_chunks = get_uploaded_document_chunks()
 
+        include_global_scan = st.checkbox(
+            "🌐 Also scan the full synthetic dataset (all customers, beyond this network)",
+            value=False,
+            key="ask_atlas_include_global",
+            help=(
+                "When on, Ask Atlas additionally indexes aggregated profiles and leaderboards (DRA score, "
+                "transaction value, flagged status) for every customer in the full underlying dataset — "
+                "not just the customers discovered within the current hop radius. This increases index "
+                "size and, if using OpenAI embeddings, embedding cost. Answers may then reference "
+                "customers outside the currently audited network, clearly labeled as '[Full dataset]'."
+            ),
+        )
+
         rag_scope_network = str(selected_network) if selected_network else str(analyzer.full_network_id)
         rag_index = build_or_get_rag_index(
             analyzer=analyzer,
@@ -4522,6 +4721,7 @@ if "analyzer" in st.session_state:
             scope_network_id=rag_scope_network,
             target_customer_id=str(target_customer_id),
             document_chunks=document_chunks,
+            include_global=include_global_scan,
         )
 
         backend_label = {
@@ -4534,9 +4734,10 @@ if "analyzer" in st.session_state:
         with col_idx1:
             n_doc_chunks = len(document_chunks)
             doc_suffix = f" (incl. {n_doc_chunks} from {len(st.session_state['ask_atlas_docs'])} uploaded doc(s))" if n_doc_chunks else ""
+            global_suffix = " + full dataset scan" if include_global_scan else ""
             st.caption(
                 f"Knowledge index: {len(rag_index.get('chunks', []))} items scoped to "
-                f"{rag_scope_network}{doc_suffix} · backend: {backend_label}"
+                f"{rag_scope_network}{doc_suffix}{global_suffix} · backend: {backend_label}"
             )
         with col_idx2:
             if st.button("🔄 Rebuild index", key="rag_rebuild_btn"):
@@ -4546,6 +4747,7 @@ if "analyzer" in st.session_state:
                     scope_network_id=rag_scope_network,
                     target_customer_id=str(target_customer_id),
                     document_chunks=document_chunks,
+                    include_global=include_global_scan,
                     force_rebuild=True,
                 )
                 st.rerun()
