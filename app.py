@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 from io import BytesIO
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import certifi
 import numpy as np
@@ -37,6 +37,22 @@ try:
     HAS_AGRAPH = True
 except ImportError:
     HAS_AGRAPH = False
+
+try:
+    from pypdf import PdfReader
+    HAS_PYPDF = True
+except ImportError:
+    try:
+        from PyPDF2 import PdfReader
+        HAS_PYPDF = True
+    except ImportError:
+        HAS_PYPDF = False
+
+try:
+    from docx import Document as DocxDocument
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
 
 from transaction_networks import AnalyzerConfig, FinancialCrimeNetworkAnalyzer, SCHEMA_COLUMNS
 
@@ -1307,21 +1323,109 @@ def build_rag_chunks(analyzer, outputs: dict, scope_network_id: str) -> List[dic
     return chunks
 
 
-def build_or_get_rag_index(analyzer, outputs: dict, scope_network_id: str, target_customer_id: str, force_rebuild: bool = False) -> dict:
+RAG_MAX_DOC_CHUNKS_PER_FILE = 150
+RAG_DOC_CHUNK_CHARS = 900
+RAG_DOC_CHUNK_OVERLAP_CHARS = 150
+
+
+def _extract_text_from_upload(uploaded_file) -> str:
+    """Extracts raw text from an uploaded PDF, DOCX, TXT, MD, or CSV file."""
+    name = uploaded_file.name
+    suffix = Path(name).suffix.lower()
+    data = uploaded_file.getvalue()
+
+    if suffix == ".pdf":
+        if not HAS_PYPDF:
+            raise RuntimeError("pypdf is not installed; add 'pypdf' to requirements.txt to enable PDF uploads.")
+        reader = PdfReader(BytesIO(data))
+        pages = []
+        for page in reader.pages:
+            try:
+                pages.append(page.extract_text() or "")
+            except Exception:
+                continue
+        text = "\n".join(pages)
+        if not text.strip():
+            raise RuntimeError("No extractable text found (this may be a scanned/image-only PDF).")
+        return text
+
+    if suffix == ".docx":
+        if not HAS_DOCX:
+            raise RuntimeError("python-docx is not installed; add 'python-docx' to requirements.txt to enable Word uploads.")
+        document = DocxDocument(BytesIO(data))
+        paras = [p.text for p in document.paragraphs if p.text.strip()]
+        for table in document.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                if cells:
+                    paras.append(" | ".join(cells))
+        return "\n".join(paras)
+
+    if suffix in (".txt", ".md", ".csv"):
+        return data.decode("utf-8", errors="replace")
+
+    raise RuntimeError(f"Unsupported file type: {suffix or '(none)'}. Supported: PDF, DOCX, TXT, MD, CSV.")
+
+
+def _chunk_document_text(text: str, source_label: str) -> List[dict]:
+    """Splits document text into overlapping chunks so long documents remain searchable in the RAG index."""
+    normalized = re.sub(r"\s+", " ", str(text)).strip()
+    if not normalized:
+        return []
+
+    chunks: List[dict] = []
+    start = 0
+    n = len(normalized)
+    idx = 1
+    while start < n and len(chunks) < RAG_MAX_DOC_CHUNKS_PER_FILE:
+        end = min(n, start + RAG_DOC_CHUNK_CHARS)
+        piece = normalized[start:end].strip()
+        if piece:
+            chunks.append({"source": f"document:{source_label}:chunk{idx}", "text": piece})
+            idx += 1
+        if end >= n:
+            break
+        start = end - RAG_DOC_CHUNK_OVERLAP_CHARS
+        if start < 0:
+            start = 0
+    return chunks
+
+
+def get_uploaded_document_chunks() -> List[dict]:
+    """Flattens all currently uploaded, successfully parsed documents into RAG chunks."""
+    doc_store = st.session_state.get("ask_atlas_docs", {})
+    chunks: List[dict] = []
+    for info in doc_store.values():
+        chunks.extend(info.get("chunks", []))
+    return chunks
+
+
+def build_or_get_rag_index(
+    analyzer,
+    outputs: dict,
+    scope_network_id: str,
+    target_customer_id: str,
+    document_chunks: Optional[List[dict]] = None,
+    force_rebuild: bool = False,
+) -> dict:
     """Builds (or reuses from session state) an in-memory retrieval index scoped to the current
-    target/network/hop/lookback configuration. Rebuilds automatically whenever that scope changes."""
+    target/network/hop/lookback configuration, merged with any uploaded document chunks. Rebuilds
+    automatically whenever that scope or the uploaded document set changes."""
+    document_chunks = document_chunks or []
+    doc_signature = tuple(sorted(c["source"] for c in document_chunks))
     scope_key = (
         str(target_customer_id),
         str(scope_network_id),
         int(getattr(analyzer.config, "n_hops", 2)),
         int(getattr(analyzer.config, "lookback_days", 180)),
         bool(getattr(analyzer.config, "use_all_dates", False)),
+        doc_signature,
     )
     cached = st.session_state.get("rag_index")
     if not force_rebuild and cached and cached.get("scope_key") == scope_key:
         return cached
 
-    chunks = build_rag_chunks(analyzer, outputs, scope_network_id)
+    chunks = build_rag_chunks(analyzer, outputs, scope_network_id) + document_chunks
     if not chunks:
         index = {"scope_key": scope_key, "chunks": [], "backend": "none", "vectors": None, "vocab": {}, "idf": None}
         st.session_state["rag_index"] = index
@@ -1372,9 +1476,13 @@ def build_ask_atlas_prompt(query: str, context_chunks: List[dict]) -> str:
     context_text = "\n".join([f"[{i + 1}] {c['text']}" for i, c in enumerate(context_chunks)])
     return (
         "You are Atlas, an AML investigator assistant. Answer the question ONLY using the numbered context "
-        "items below, which are drawn directly from this case's own network analysis output (nothing external). "
+        "items below. These are drawn from two possible sources: this case's own network analysis output "
+        "(network summary, themes, node risk, transaction corridors), and any documents the investigator has "
+        "uploaded for this case. Draw on whichever source is relevant, and combine both when useful — e.g. "
+        "connecting a fact from an uploaded document to a specific customer or transaction in the network data. "
         "If the answer is not present in the context, say so plainly rather than guessing or inventing facts. "
-        "Cite the relevant item numbers in brackets, e.g. [2], [4]. Keep the answer concise and factual.\n\n"
+        "Cite the relevant item numbers in brackets, e.g. [2], [4], and note whether each cited item came from "
+        "the network data or an uploaded document. Keep the answer concise and factual.\n\n"
         f"Context:\n{context_text}\n\n"
         f"Question: {query}\n"
         "Answer:"
@@ -1396,9 +1504,9 @@ def generate_ask_atlas_answer(query: str, context_chunks: List[dict], ai_provide
     unavailable or unconfigured. Returns (answer_text, status_message)."""
     if not context_chunks:
         return (
-            "I couldn't find anything relevant to that in the current network analysis output. Try "
-            "rephrasing the question, or widen the hop radius / lookback window in the sidebar and rerun "
-            "the analysis.",
+            "I couldn't find anything relevant to that in the current network analysis output or any "
+            "uploaded documents. Try rephrasing the question, upload a relevant document, or widen the "
+            "hop radius / lookback window in the sidebar and rerun the analysis.",
             "No retrieved context matched this query.",
         )
 
@@ -4286,8 +4394,57 @@ if "analyzer" in st.session_state:
         st.caption(
             "Ask questions grounded in this run's network summary, theme/subtheme triggers, node risk "
             "rankings, transaction corridors, and flagged/high-value transactions for the selected "
-            f"target/network. Answers use the AI provider selected in the sidebar ({ai_provider})."
+            f"target/network — plus any documents you upload below. Answers use the AI provider selected "
+            f"in the sidebar ({ai_provider})."
         )
+
+        if "ask_atlas_docs" not in st.session_state:
+            st.session_state["ask_atlas_docs"] = {}
+
+        with st.expander("📎 Upload supporting documents (optional)", expanded=False):
+            st.caption(
+                "PDF, DOCX, TXT, MD, or CSV. Extracted text is chunked and added to the knowledge index "
+                "alongside the network analysis, so Ask Atlas can connect facts from a document (e.g. a "
+                "KYC file, SAR narrative, or policy note) to specific customers or transactions in the data."
+            )
+            new_uploads = st.file_uploader(
+                "Upload documents",
+                type=["pdf", "docx", "txt", "md", "csv"],
+                accept_multiple_files=True,
+                key="ask_atlas_uploader",
+                label_visibility="collapsed",
+            )
+            if new_uploads:
+                for f in new_uploads:
+                    doc_key = f"{f.name}:{f.size}"
+                    if doc_key not in st.session_state["ask_atlas_docs"]:
+                        try:
+                            extracted_text = _extract_text_from_upload(f)
+                            doc_chunks = _chunk_document_text(extracted_text, source_label=f.name)
+                            st.session_state["ask_atlas_docs"][doc_key] = {
+                                "name": f.name, "chunks": doc_chunks, "error": None,
+                            }
+                        except Exception as doc_ex:
+                            st.session_state["ask_atlas_docs"][doc_key] = {
+                                "name": f.name, "chunks": [], "error": str(doc_ex),
+                            }
+
+            if st.session_state["ask_atlas_docs"]:
+                for doc_key, info in list(st.session_state["ask_atlas_docs"].items()):
+                    doc_col1, doc_col2 = st.columns([5, 1])
+                    with doc_col1:
+                        if info.get("error"):
+                            st.error(f"❌ {info['name']}: {info['error']}")
+                        else:
+                            st.caption(f"✅ {info['name']} — {len(info['chunks'])} chunks indexed")
+                    with doc_col2:
+                        if st.button("Remove", key=f"remove_doc_{doc_key}"):
+                            del st.session_state["ask_atlas_docs"][doc_key]
+                            st.rerun()
+            else:
+                st.caption("No documents uploaded yet.")
+
+        document_chunks = get_uploaded_document_chunks()
 
         rag_scope_network = str(selected_network) if selected_network else str(analyzer.full_network_id)
         rag_index = build_or_get_rag_index(
@@ -4295,6 +4452,7 @@ if "analyzer" in st.session_state:
             outputs=outputs,
             scope_network_id=rag_scope_network,
             target_customer_id=str(target_customer_id),
+            document_chunks=document_chunks,
         )
 
         backend_label = {
@@ -4305,9 +4463,11 @@ if "analyzer" in st.session_state:
 
         col_idx1, col_idx2 = st.columns([3, 1])
         with col_idx1:
+            n_doc_chunks = len(document_chunks)
+            doc_suffix = f" (incl. {n_doc_chunks} from {len(st.session_state['ask_atlas_docs'])} uploaded doc(s))" if n_doc_chunks else ""
             st.caption(
                 f"Knowledge index: {len(rag_index.get('chunks', []))} items scoped to "
-                f"{rag_scope_network} · backend: {backend_label}"
+                f"{rag_scope_network}{doc_suffix} · backend: {backend_label}"
             )
         with col_idx2:
             if st.button("🔄 Rebuild index", key="rag_rebuild_btn"):
@@ -4316,6 +4476,7 @@ if "analyzer" in st.session_state:
                     outputs=outputs,
                     scope_network_id=rag_scope_network,
                     target_customer_id=str(target_customer_id),
+                    document_chunks=document_chunks,
                     force_rebuild=True,
                 )
                 st.rerun()
@@ -4338,7 +4499,7 @@ if "analyzer" in st.session_state:
                                 st.caption(f"[{i}] {c['source']} · similarity {c['score']:.3f}")
                                 st.text(c["text"])
 
-        user_query = st.chat_input("Ask anything about the networks found (e.g. 'Why is customer X flagged?')")
+        user_query = st.chat_input("Ask anything about the networks found or your uploaded documents")
         if user_query:
             st.session_state[history_key].append({"role": "user", "content": user_query})
             with st.spinner("Retrieving context and generating answer..."):
